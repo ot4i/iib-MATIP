@@ -1,0 +1,11 @@
+
+
+CREATE COMPUTE MODULE Session_Open_UpdateSessionState
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		SET Session.State = 'Active';
+		SET Session.TimestampLastUpdate = CURRENT_TIMESTAMP;
+		RETURN TRUE;
+	END;
+
+END MODULE;

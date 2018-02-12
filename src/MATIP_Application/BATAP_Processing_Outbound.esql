@@ -1,0 +1,156 @@
+
+DECLARE WindowSize EXTERNAL INTEGER 10;
+DECLARE MaximumPDMs EXTERNAL INTEGER 3;
+DECLARE NextSRLN SHARED INTEGER 1;
+
+CREATE COMPUTE MODULE BATAP_Processing_Outbound_CheckSessionAndWindow
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		-- Possible session states are:  Closed, Suspended, Query, Binding, Active
+		-- Active = Session has been established, and the flow is ready to exchange data with a MATIP application
+		-- Closed = Session was established and has now been shut down.  Investigate why ... meanwhile messages can't be exchanged so route to FAIL queue.
+		-- Suspended = Session is established, but suspended temporarily.  Rollback the message then it will get retried. 
+		-- Query = Session is established but has gone dormant - in process of checking why.  Rollback the message then it will get retried.
+		-- Binding = Session is in process of being established.  Rollback the message then it will get retried.		
+		IF Session.State = 'Active' THEN
+			-- Now check the window to make sure there is space to send some more data ...
+			SET OutputRoot = InputRoot;
+			IF CARDINALITY(Session.Window.*[]) < WindowSize THEN
+				DECLARE CharSRLN CHAR CAST(NextSRLN AS CHAR);
+				WHILE LENGTH(CharSRLN) < 3 DO
+					SET CharSRLN = '0' || CharSRLN;
+				END WHILE;
+				CREATE LASTCHILD OF Session.Window NAME CharSRLN VALUE CharSRLN;
+				SET Session.TimestampLastUpdate = CURRENT_TIMESTAMP;
+				-- Store the SRLN in the Environment so that when we prepare the 
+				-- Timeout message in one of the next nodes we can use the value as a unique identifier.
+				SET Environment.SRLN = CharSRLN;
+				-- The space character in the BATAP Trailer indicates a "Normal" message as opposed to a PDM.
+				SET CharSRLN = ' ' || CharSRLN;
+				SET OutputRoot = InputRoot;
+				SET OutputRoot.BLOB.BLOB = OutputRoot.BLOB.BLOB || CAST(CharSRLN AS BLOB CCSID 1208);
+				SET NextSRLN = NextSRLN + 1;
+			END IF;
+			PROPAGATE TO TERMINAL 'out';
+		ELSEIF	(Session.State = 'Suspended') OR
+				(Session.State = 'Query') OR
+				(Session.State = 'Binding') THEN
+			DECLARE ExceptionMsg CHARACTER;
+			SET ExceptionMsg = 	'Session State of ' || Session.State || 
+			' so messages cannot be exchanged at the moment. Rolling back message to input queue named MATIP.IN';
+			THROW USER EXCEPTION MESSAGE 2951 VALUES(ExceptionMsg) ;
+		ELSEIF Session.State = 'Closed' THEN
+			-- Messages cannot be exchanged, so route to FAIL QUEUE.
+			SET OutputRoot = InputRoot;
+			PROPAGATE TO TERMINAL 'out1';
+		ELSE
+			-- This should never occur!
+		END IF;	
+		
+		RETURN FALSE;
+	END;
+
+	CREATE PROCEDURE CopyMessageHeaders() BEGIN
+		DECLARE I INTEGER 1;
+		DECLARE J INTEGER;
+		SET J = CARDINALITY(InputRoot.*[]);
+		WHILE I < J DO
+			SET OutputRoot.*[I] = InputRoot.*[I];
+			SET I = I + 1;
+		END WHILE;
+	END;
+
+	CREATE PROCEDURE CopyEntireMessage() BEGIN
+		SET OutputRoot = InputRoot;
+	END;
+END MODULE;
+
+
+CREATE COMPUTE MODULE BATAP_Processing_Outbound_CreatePDM
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		
+		-- The Timeout nodes in the message flow have been configured such that
+		-- the original Data message which was sent to MATIP will be present in 
+		-- InputRoot of the logical tree which arrives at this node.  This node
+		-- is responsible for re-sending the message as a Possible Duplicate 
+		-- Message (PDM).  This is done by setting the PDM flag in the BATAP Trailer
+		-- and reassigning a new SRLN number.  
+		-- The new transmission takes the same window slot as the original.  The key
+		-- value for the slot will remain the original so that the original message which
+		-- is stored as the timeout message can locate the window slot even after multiple PDMs.
+		-- For example ... after the initial message, the Window tree might look like this:
+		-- Session
+		--      |-- Window
+		--				|-- 001 = 001
+		-- When the SRLN 001 is sent as a PDM, it might be given the SRLN of 023 for example ...	
+		-- Session
+		--      |-- Window
+		--				|-- 001 = 001,023
+		-- Imagine, there is still no response, and the next PDM is sent as SRLN 038 for example ...
+		-- Session
+		--      |-- Window
+		--				|-- 001 = 001,023,038 
+		-- .. and so on until the maxPDM value is reached, at which point the 001 slot will be 
+		-- removed from the Window altogether!
+		-- This design means there is no further timeout processing needed after this node, 
+		-- because the initial timeout is responsible for generating these further PDMs (if required).
+
+		IF Session.State = 'Active' THEN
+			SET OutputRoot = InputRoot;
+			DECLARE OldSRLN CHAR;
+			SET OldSRLN = CAST(SUBSTRING(OutputRoot.BLOB.BLOB FROM (LENGTH(OutputRoot.BLOB.BLOB) - 2) FOR 3) AS CHAR CCSID 1208);
+			IF POSITION(',' IN Session.Window.{OldSRLN} REPEAT (MaximumPDMs)) > 0 THEN
+				-- This means that the requisite number of PDM retries have already been attempted
+				-- So delete (release) the relevant window entry and throw away the message!
+				SET Session.Window.{OldSRLN} = NULL;
+			ELSE
+				DECLARE CharSRLN CHAR CAST(NextSRLN AS CHAR);
+				WHILE LENGTH(CharSRLN) < 3 DO
+					SET CharSRLN = '0' || CharSRLN;
+				END WHILE;
+				-- Update the relevant Window entry in the Session ROW shared variable ...
+				SET Session.Window.{OldSRLN} = Session.Window.{OldSRLN} || ',' || CharSRLN;			
+				SET Session.TimestampLastUpdate = CURRENT_TIMESTAMP;
+				-- Store the SRLN in the Environment - just doing this for completeness - this isnt used
+				-- as in this circumstance there is no Timeout processing after this node (unlike after 
+				-- node CheckSessionAndWindow)
+				SET Environment.SRLN = CharSRLN;
+				-- The P character in the BATAP Trailer indicates a PDM message as opposed to a "Normal" message.
+				SET CharSRLN = 'P' || CharSRLN;
+				SET OutputRoot.BLOB.BLOB = OVERLAY(OutputRoot.BLOB.BLOB PLACING CAST(CharSRLN AS BLOB CCSID 1208) FROM (LENGTH(OutputRoot.BLOB.BLOB)-3) FOR 4);
+				SET NextSRLN = NextSRLN + 1;
+				PROPAGATE TO TERMINAL 'out';
+			END IF;
+		ELSEIF	(Session.State = 'Suspended') OR
+				(Session.State = 'Query') OR
+				(Session.State = 'Binding') THEN
+			DECLARE ExceptionMsg CHARACTER;
+			SET ExceptionMsg = 	'Session State of ' || Session.State || 
+			' so PDM messages cannot be exchanged at the moment. Rolling back timeout message';
+			THROW USER EXCEPTION MESSAGE 2951 VALUES(ExceptionMsg) ;
+		ELSEIF Session.State = 'Closed' THEN
+			-- Messages cannot be exchanged, so route to FAIL QUEUE.
+			SET OutputRoot = InputRoot;
+			PROPAGATE TO TERMINAL 'out1';
+		ELSE
+			-- This should never occur!
+		END IF;	
+		RETURN FALSE;
+		
+	END;
+
+	CREATE PROCEDURE CopyMessageHeaders() BEGIN
+		DECLARE I INTEGER 1;
+		DECLARE J INTEGER;
+		SET J = CARDINALITY(InputRoot.*[]);
+		WHILE I < J DO
+			SET OutputRoot.*[I] = InputRoot.*[I];
+			SET I = I + 1;
+		END WHILE;
+	END;
+
+	CREATE PROCEDURE CopyEntireMessage() BEGIN
+		SET OutputRoot = InputRoot;
+	END;
+END MODULE;

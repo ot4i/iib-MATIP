@@ -1,0 +1,12 @@
+DECLARE Session SHARED ROW;
+
+CREATE COMPUTE MODULE MATIP_Client_InitialiseSessionState
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		SET OutputRoot = InputRoot;
+		SET Session.State = 'Binding';
+		SET Session.TimestampLastUpdate = CURRENT_TIMESTAMP;
+		RETURN TRUE;
+	END;
+
+END MODULE;

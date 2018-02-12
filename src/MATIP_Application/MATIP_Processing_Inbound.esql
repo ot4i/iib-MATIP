@@ -1,0 +1,62 @@
+
+
+CREATE COMPUTE MODULE MATIP_Processing_Inbound_CheckSessionAndRoute
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		SET OutputLocalEnvironment = InputLocalEnvironment;
+		IF Session.State = 'Active' THEN		
+			-- This means that the session is valid so we can continue processing this message ...
+			-- Arrival of the message this far represents activity from the MATIP application so update the session ...
+			SET Session.TimestampLastUpdate = CURRENT_TIMESTAMP;
+			-- The LocalEnvironment should already have been set up to record whether this message is a Command or Data ...
+			IF InputLocalEnvironment.MATIP.CommandOrData = 'Command' THEN
+				-- The 3 character identifier held in the Local Environment records what kind of command message we have.
+				-- Use this 3 character identifier as the Label node that we want to route to.
+				SET OutputLocalEnvironment.Destination.RouterList.DestinationData.label = InputLocalEnvironment.MATIP.Command;
+			END IF;
+			IF InputLocalEnvironment.MATIP.CommandOrData = 'Data' THEN
+				-- Data messages are IMA or Data ... Either way we route to the Label node named DATA
+				SET OutputLocalEnvironment.Destination.RouterList.DestinationData.label = 'DATA';
+			END IF;
+			SET OutputRoot = InputRoot;
+			RETURN TRUE;
+		ELSE
+			PROPAGATE TO TERMINAL 'out1';
+			RETURN FALSE;
+		END IF;
+	END;
+END MODULE;
+
+
+CREATE COMPUTE MODULE MATIP_Processing_Inbound_ProcessIMA
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+
+		DECLARE StringInputMessage CHAR CAST(InputRoot.BLOB.BLOB AS CHAR CCSID 1208);
+		IF SUBSTRING(StringInputMessage FROM 1 FOR 3) = 'IMA' THEN
+			-- Need to add a check in here in case the IMA was badly formed.
+			DECLARE NumberOfAcks INTEGER (LENGTH(StringInputMessage) - 3)/3;
+			DECLARE I INTEGER 1;
+			DECLARE ackedSRLN CHAR;
+			WHILE I <= NumberOfAcks DO
+				SET OutputLocalEnvironment = InputLocalEnvironment;
+				SET ackedSRLN = SUBSTRING(StringInputMessage FROM (3*I+1) FOR 3);
+				SET Session.Window.{ackedSRLN} = NULL;
+				SET Session.TimestampLastUpdate = CURRENT_TIMESTAMP;
+				SET OutputRoot = InputRoot;
+				-- Same input message (with multiple SRLN numbers in the IMA) is used for each propagation
+				-- It's the LE Timeoutrequest which is the important bit (with different SRLN in each propagation)
+				SET OutputLocalEnvironment.TimeoutRequest.Action = 'CANCEL';
+				SET OutputLocalEnvironment.TimeoutRequest.Identifier = ackedSRLN;
+				PROPAGATE TO TERMINAL 'out';
+			END WHILE;
+		ELSE
+			SET OutputLocalEnvironment = InputLocalEnvironment;
+			SET OutputRoot = InputRoot;
+			PROPAGATE TO TERMINAL 'out1';
+		END IF;
+
+		RETURN FALSE;
+	END;
+
+END MODULE;
